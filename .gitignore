@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+/tmp/hotspot_*
+hotspot_backend.pid
+hotspot_status.json
+hotspot_qr.png
