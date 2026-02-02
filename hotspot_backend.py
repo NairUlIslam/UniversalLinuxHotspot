@@ -55,7 +55,7 @@ def get_wifi_interfaces():
 def get_detailed_interfaces():
     """
     Get detailed information about all network interfaces.
-    Returns list of dicts with: name, type, driver, bus, ap_support, connected, connection_name, label
+    Returns list of dicts with comprehensive info for each interface.
     """
     interfaces = []
     
@@ -67,6 +67,31 @@ def get_detailed_interfaces():
         if not output:
             return interfaces
         
+        # Also get IP addresses for each interface
+        ip_info = {}
+        try:
+            ip_output = subprocess.run(['ip', '-4', 'addr', 'show'], capture_output=True, text=True, timeout=5)
+            current_iface = None
+            for line in ip_output.stdout.splitlines():
+                if not line.startswith(' '):
+                    parts = line.split(':')
+                    if len(parts) >= 2:
+                        current_iface = parts[1].strip()
+                elif 'inet ' in line and current_iface:
+                    ip_match = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)', line)
+                    if ip_match:
+                        ip_info[current_iface] = ip_match.group(1)
+        except:
+            pass
+        
+        # Check for VPN tunnels and other special interfaces
+        all_ifaces = []
+        try:
+            for iface_dir in os.listdir('/sys/class/net'):
+                all_ifaces.append(iface_dir)
+        except:
+            pass
+        
         for line in output.splitlines():
             parts = line.split(':')
             if len(parts) < 3:
@@ -77,8 +102,9 @@ def get_detailed_interfaces():
             dev_state = parts[2]
             dev_connection = parts[3] if len(parts) > 3 else ""
             
-            # Skip virtual and P2P interfaces
-            if dev_name.startswith(('lo', 'docker', 'br-', 'veth', 'virbr', 'p2p-')):
+            # Skip certain virtual interfaces but keep useful ones
+            skip_prefixes = ('lo', 'docker', 'br-', 'veth', 'virbr', 'p2p-', 'vboxnet')
+            if dev_name.startswith(skip_prefixes):
                 continue
             if dev_type == 'wifi-p2p':
                 continue
@@ -93,51 +119,155 @@ def get_detailed_interfaces():
                 'bus': None,
                 'is_usb': False,
                 'is_internal': False,
+                'is_vpn': False,
+                'is_mobile': False,
+                'is_tethered': False,
+                'is_bridge': False,
                 'ap_support': False,
                 'supports_5ghz': False,
-                'label': dev_name
+                'in_monitor_mode': False,
+                'has_ip': dev_name in ip_info,
+                'ip_address': ip_info.get(dev_name),
+                'is_internet_source': False,
+                'label': dev_name,
+                'issues': []  # List of potential problems
             }
+            
+            # Detect special interface types
+            # VPN tunnels
+            if dev_name.startswith(('tun', 'tap', 'wg', 'ppp', 'vpn')):
+                iface_info['is_vpn'] = True
+                iface_info['type'] = 'vpn'
+            
+            # Mobile broadband
+            if dev_name.startswith(('wwan', 'wwp', 'cdc', 'mbim')):
+                iface_info['is_mobile'] = True
+                iface_info['type'] = 'mobile'
+            
+            # USB tethering (Android/iPhone)
+            if dev_name.startswith(('usb', 'enp0s20u', 'enp0s2')) and 'usb' in dev_name.lower():
+                iface_info['is_tethered'] = True
+            
+            # Bridge interfaces (some may be useful)
+            if dev_name.startswith('br') and not dev_name.startswith('br-'):
+                iface_info['is_bridge'] = True
+                iface_info['type'] = 'bridge'
             
             # Get driver and bus info
             try:
                 # Check if USB device
-                usb_check = subprocess.run(
-                    ['readlink', '-f', f'/sys/class/net/{dev_name}/device'],
-                    capture_output=True, text=True, timeout=2
-                )
-                if usb_check.returncode == 0:
-                    device_path = usb_check.stdout.strip()
-                    iface_info['is_usb'] = '/usb' in device_path
-                    iface_info['is_internal'] = '/pci' in device_path and '/usb' not in device_path
-                
-                # Get driver name
-                driver_link = f'/sys/class/net/{dev_name}/device/driver'
-                driver_check = subprocess.run(
-                    ['readlink', '-f', driver_link],
-                    capture_output=True, text=True, timeout=2
-                )
-                if driver_check.returncode == 0:
-                    iface_info['driver'] = os.path.basename(driver_check.stdout.strip())
+                device_path_link = f'/sys/class/net/{dev_name}/device'
+                if os.path.exists(device_path_link):
+                    usb_check = subprocess.run(
+                        ['readlink', '-f', device_path_link],
+                        capture_output=True, text=True, timeout=2
+                    )
+                    if usb_check.returncode == 0:
+                        device_path = usb_check.stdout.strip()
+                        iface_info['is_usb'] = '/usb' in device_path
+                        iface_info['is_internal'] = '/pci' in device_path and '/usb' not in device_path
+                    
+                    # Get driver name
+                    driver_link = f'{device_path_link}/driver'
+                    if os.path.exists(driver_link):
+                        driver_check = subprocess.run(
+                            ['readlink', '-f', driver_link],
+                            capture_output=True, text=True, timeout=2
+                        )
+                        if driver_check.returncode == 0:
+                            iface_info['driver'] = os.path.basename(driver_check.stdout.strip())
             except:
                 pass
             
-            # Check AP mode support for WiFi interfaces
+            # Check AP mode support and monitor mode for WiFi interfaces
             if dev_type == 'wifi':
-                ap_ok, _ = check_ap_mode_support_for_iface(dev_name)
+                ap_ok, ap_err = check_ap_mode_support_for_iface(dev_name)
                 iface_info['ap_support'] = ap_ok
+                if not ap_ok:
+                    iface_info['issues'].append("No AP mode support")
                 
                 # Check 5GHz support
                 iface_info['supports_5ghz'] = check_5ghz_support_for_iface(dev_name)
+                
+                # Check if in monitor mode
+                try:
+                    iw_info = subprocess.run(['iw', 'dev', dev_name, 'info'], 
+                                            capture_output=True, text=True, timeout=3)
+                    if 'type monitor' in iw_info.stdout.lower():
+                        iface_info['in_monitor_mode'] = True
+                        iface_info['issues'].append("In monitor mode")
+                except:
+                    pass
+            
+            # Check for connectivity issues
+            if iface_info['connected'] and not iface_info['has_ip']:
+                iface_info['issues'].append("Connected but no IP")
             
             # Generate human-friendly label
             iface_info['label'] = generate_interface_label(iface_info)
             
             interfaces.append(iface_info)
+        
+        # Determine which interface is providing internet
+        try:
+            route_output = subprocess.run(['ip', 'route', 'show', 'default'], 
+                                         capture_output=True, text=True, timeout=5)
+            if route_output.returncode == 0:
+                match = re.search(r'dev\s+(\S+)', route_output.stdout)
+                if match:
+                    internet_iface = match.group(1)
+                    for iface in interfaces:
+                        if iface['name'] == internet_iface:
+                            iface['is_internet_source'] = True
+                            break
+        except:
+            pass
     
     except Exception as e:
         print(f"Error discovering interfaces: {e}")
     
     return interfaces
+
+def get_all_internet_sources():
+    """Get all interfaces that could provide internet (including VPN tunnels)."""
+    interfaces = get_detailed_interfaces()
+    sources = []
+    
+    # Priority order: Ethernet > Mobile > Tethered > VPN > WiFi
+    for iface in interfaces:
+        if not iface['connected'] and not iface['has_ip']:
+            continue
+        
+        source_info = {
+            'name': iface['name'],
+            'label': iface['label'],
+            'type': iface['type'],
+            'priority': 0,
+            'is_vpn': iface['is_vpn'],
+            'is_optimal': False
+        }
+        
+        # Assign priority
+        if iface['type'] == 'ethernet' and iface['has_ip']:
+            source_info['priority'] = 100
+            source_info['is_optimal'] = True
+        elif iface['is_mobile'] and iface['has_ip']:
+            source_info['priority'] = 80
+        elif iface['is_tethered'] and iface['has_ip']:
+            source_info['priority'] = 70
+        elif iface['is_vpn'] and iface['has_ip']:
+            source_info['priority'] = 60
+        elif iface['type'] == 'wifi' and iface['connected']:
+            source_info['priority'] = 50
+        
+        if source_info['priority'] > 0:
+            sources.append(source_info)
+    
+    # Sort by priority
+    sources.sort(key=lambda x: x['priority'], reverse=True)
+    return sources
+
+
 
 def check_ap_mode_support_for_iface(iface):
     """Check if a specific interface supports AP mode."""
@@ -214,25 +344,31 @@ def check_5ghz_support_for_iface(iface):
 def generate_interface_label(iface_info):
     """Generate a human-friendly label for an interface."""
     name = iface_info['name']
-    itype = iface_info['type']
+    itype = iface_info.get('type', 'unknown')
     
     parts = []
     
-    # Base type
+    # Base type with clear descriptions
     if itype == 'wifi':
-        if iface_info['is_usb']:
-            parts.append("USB Wi-Fi Adapter")
-        elif iface_info['is_internal']:
-            parts.append("Built-in Wi-Fi")
+        if iface_info.get('is_usb'):
+            parts.append("🔌 USB Wi-Fi Adapter")
+        elif iface_info.get('is_internal'):
+            parts.append("📶 Built-in Wi-Fi")
         else:
-            parts.append("Wi-Fi")
+            parts.append("📶 Wi-Fi")
     elif itype == 'ethernet':
-        if iface_info['is_usb']:
-            parts.append("USB Ethernet")
+        if iface_info.get('is_usb'):
+            parts.append("🔌 USB Ethernet")
         else:
-            parts.append("Ethernet")
+            parts.append("🔗 Ethernet")
+    elif itype == 'vpn' or iface_info.get('is_vpn'):
+        parts.append("🔒 VPN Tunnel")
+    elif itype == 'mobile' or iface_info.get('is_mobile'):
+        parts.append("📱 Mobile Broadband")
+    elif iface_info.get('is_tethered'):
+        parts.append("📱 Phone Tethering")
     elif itype == 'bridge':
-        parts.append("Bridge")
+        parts.append("🌉 Bridge")
     else:
         parts.append(itype.title())
     
@@ -243,15 +379,28 @@ def generate_interface_label(iface_info):
             caps.append("AP")
         if iface_info.get('supports_5ghz'):
             caps.append("5GHz")
+        if iface_info.get('in_monitor_mode'):
+            caps.append("⚠️Monitor")
         if caps:
             parts.append(f"[{', '.join(caps)}]")
+    
+    # Mark as internet source
+    if iface_info.get('is_internet_source'):
+        parts.append("🌐")
     
     # Add connection status
     if iface_info.get('connected') and iface_info.get('connection_name'):
         parts.append(f"→ {iface_info['connection_name']}")
+    elif iface_info.get('has_ip'):
+        parts.append(f"→ {iface_info.get('ip_address', 'connected')}")
     
     # Add device name
     parts.append(f"({name})")
+    
+    # Add issues if any
+    issues = iface_info.get('issues', [])
+    if issues:
+        parts.append(f"⚠️ {', '.join(issues)}")
     
     return " ".join(parts)
 
@@ -259,75 +408,128 @@ def get_smart_interface_selection():
     """
     Intelligently select which interface should be used for internet and which for hotspot.
     Returns: (internet_iface, hotspot_iface, reason)
+    
+    Priority for Internet Source:
+    1. Ethernet (wired) - most stable
+    2. Mobile broadband (wwan)
+    3. Phone tethering (usb0)
+    4. VPN tunnel (if route_vpn enabled)
+    5. WiFi connection
+    
+    Priority for Hotspot:
+    1. USB WiFi adapter with AP support (leaves internal free)
+    2. Internal WiFi with AP support (if not needed for internet)
+    3. Any WiFi with AP support
     """
     interfaces = get_detailed_interfaces()
     
     # Categorize interfaces
     ethernet_ifaces = [i for i in interfaces if i['type'] == 'ethernet' and i['state'] != 'unavailable']
     wifi_ifaces = [i for i in interfaces if i['type'] == 'wifi']
-    usb_wifi = [i for i in wifi_ifaces if i['is_usb'] and i['ap_support']]
-    internal_wifi = [i for i in wifi_ifaces if i['is_internal']]
-    ap_capable_wifi = [i for i in wifi_ifaces if i['ap_support']]
+    vpn_ifaces = [i for i in interfaces if i.get('is_vpn') and i.get('has_ip')]
+    mobile_ifaces = [i for i in interfaces if i.get('is_mobile') and i.get('has_ip')]
+    tether_ifaces = [i for i in interfaces if i.get('is_tethered') and i.get('has_ip')]
+    
+    # Filter WiFi by capabilities
+    usb_wifi = [i for i in wifi_ifaces if i.get('is_usb') and i.get('ap_support') and not i.get('in_monitor_mode')]
+    internal_wifi = [i for i in wifi_ifaces if i.get('is_internal') and not i.get('in_monitor_mode')]
+    ap_capable_wifi = [i for i in wifi_ifaces if i.get('ap_support') and not i.get('in_monitor_mode')]
+    
+    # Find connected interfaces
+    connected_ethernet = [i for i in ethernet_ifaces if i.get('connected') or i.get('has_ip')]
+    connected_wifi = [i for i in wifi_ifaces if i.get('connected')]
     
     internet_iface = None
     hotspot_iface = None
     reason = ""
+    warnings = []
     
-    # Best case: Ethernet for internet, any WiFi for hotspot
-    connected_ethernet = [i for i in ethernet_ifaces if i['connected']]
-    if connected_ethernet and ap_capable_wifi:
-        internet_iface = connected_ethernet[0]['name']
-        # Prefer USB WiFi for hotspot if available
-        hotspot_iface = usb_wifi[0]['name'] if usb_wifi else ap_capable_wifi[0]['name']
-        reason = "Using Ethernet for internet, WiFi for hotspot (optimal)"
-        return internet_iface, hotspot_iface, reason
+    # === DETERMINE INTERNET SOURCE ===
     
-    # Second best: Two WiFi adapters - internal for internet, USB for hotspot
-    if len(wifi_ifaces) >= 2:
-        connected_internal = [i for i in internal_wifi if i['connected']]
-        if connected_internal and usb_wifi:
-            internet_iface = connected_internal[0]['name']
-            hotspot_iface = usb_wifi[0]['name']
-            reason = "Using internal WiFi for internet, USB adapter for hotspot"
-            return internet_iface, hotspot_iface, reason
-    
-    # Third: Single WiFi adapter case
-    if len(wifi_ifaces) == 1 and wifi_ifaces[0]['ap_support']:
-        wifi = wifi_ifaces[0]
-        if wifi['connected']:
-            # This is the risky case - only one WiFi and it's the internet source
-            hotspot_iface = wifi['name']
-            internet_iface = wifi['name']
-            reason = "WARNING: Single WiFi adapter - will disconnect from current network"
-            return internet_iface, hotspot_iface, reason
-        else:
-            hotspot_iface = wifi['name']
-            if connected_ethernet:
-                internet_iface = connected_ethernet[0]['name']
-                reason = "Using disconnected WiFi for hotspot, Ethernet for internet"
-            else:
-                internet_iface = None
-                reason = "No internet source available"
-            return internet_iface, hotspot_iface, reason
-    
-    # Fallback: Just pick what's available
-    if ap_capable_wifi:
-        hotspot_iface = ap_capable_wifi[0]['name']
+    # Priority 1: Ethernet with IP
     if connected_ethernet:
-        internet_iface = connected_ethernet[0]['name']
-    elif wifi_ifaces:
-        connected_wifi = [i for i in wifi_ifaces if i['connected']]
-        if connected_wifi:
-            internet_iface = connected_wifi[0]['name']
+        best_eth = connected_ethernet[0]
+        internet_iface = best_eth['name']
+        if best_eth.get('is_usb'):
+            reason = "🔗 Using USB Ethernet for internet"
+        else:
+            reason = "🔗 Using Ethernet for internet (optimal)"
     
-    if not hotspot_iface:
-        reason = "No WiFi adapter with AP support found"
-    elif not internet_iface:
-        reason = "No internet source available"
+    # Priority 2: Mobile broadband
+    elif mobile_ifaces:
+        internet_iface = mobile_ifaces[0]['name']
+        reason = "📱 Using Mobile Broadband for internet"
+    
+    # Priority 3: Phone tethering
+    elif tether_ifaces:
+        internet_iface = tether_ifaces[0]['name']
+        reason = "📱 Using Phone Tethering for internet"
+    
+    # Priority 4: Connected WiFi (will warn if same as hotspot)
+    elif connected_wifi:
+        internet_iface = connected_wifi[0]['name']
+        reason = "📶 Using WiFi for internet"
+    
+    # No internet source found
     else:
-        reason = "Auto-selected based on availability"
+        reason = "⚠️ No internet source found"
+        warnings.append("Hotspot clients will not have internet access")
+    
+    # === DETERMINE HOTSPOT INTERFACE ===
+    
+    # Check for monitor mode conflicts
+    monitor_mode_ifaces = [i for i in wifi_ifaces if i.get('in_monitor_mode')]
+    if monitor_mode_ifaces:
+        warnings.append(f"{monitor_mode_ifaces[0]['name']} is in monitor mode (cannot use for AP)")
+    
+    # Priority 1: USB WiFi adapter with AP support
+    if usb_wifi:
+        hotspot_iface = usb_wifi[0]['name']
+        reason += " | 🔌 USB adapter for hotspot"
+    
+    # Priority 2: Internal WiFi NOT being used for internet
+    elif internal_wifi:
+        internal_with_ap = [i for i in internal_wifi if i.get('ap_support')]
+        if internal_with_ap:
+            candidate = internal_with_ap[0]
+            hotspot_iface = candidate['name']
+            
+            # Check if this is also the internet source
+            if candidate['name'] == internet_iface:
+                if len(wifi_ifaces) == 1 and not connected_ethernet and not mobile_ifaces and not tether_ifaces:
+                    # Critical: only one WiFi and it's providing internet
+                    reason = "⚠️ SINGLE ADAPTER: Will disconnect from current network"
+                    warnings.append("Your only WiFi will switch from client to AP mode")
+                else:
+                    reason += " | 📶 Built-in WiFi for hotspot"
+            else:
+                reason += " | 📶 Built-in WiFi for hotspot"
+    
+    # Priority 3: Any AP-capable WiFi
+    elif ap_capable_wifi:
+        hotspot_iface = ap_capable_wifi[0]['name']
+        reason += " | 📶 WiFi for hotspot"
+    
+    # No usable WiFi for hotspot
+    else:
+        if wifi_ifaces:
+            no_ap = [i for i in wifi_ifaces if not i.get('ap_support')]
+            if no_ap:
+                reason = f"❌ No AP support: {no_ap[0]['name']} cannot create hotspot"
+            elif monitor_mode_ifaces:
+                reason = f"❌ {monitor_mode_ifaces[0]['name']} in monitor mode"
+            else:
+                reason = "❌ WiFi adapters have issues"
+        else:
+            reason = "❌ No WiFi adapter found"
+    
+    # Add warnings to reason
+    if warnings:
+        reason += " | ⚠️ " + "; ".join(warnings)
     
     return internet_iface, hotspot_iface, reason
+
+
 
 
 
@@ -443,6 +645,14 @@ def preflight_checks(interface=None, ssid=None, password=None, exclude_vpn=False
     errors = []
     warnings = []
     
+    # Get detailed interface information
+    all_interfaces = get_detailed_interfaces()
+    wifi_interfaces = [i for i in all_interfaces if i['type'] == 'wifi']
+    ethernet_interfaces = [i for i in all_interfaces if i['type'] == 'ethernet']
+    mobile_interfaces = [i for i in all_interfaces if i.get('is_mobile')]
+    tether_interfaces = [i for i in all_interfaces if i.get('is_tethered')]
+    vpn_interfaces = [i for i in all_interfaces if i.get('is_vpn')]
+    
     # 1. Check if NetworkManager is running
     try:
         result = subprocess.run(['systemctl', 'is-active', 'NetworkManager'], 
@@ -459,113 +669,175 @@ def preflight_checks(interface=None, ssid=None, password=None, exclude_vpn=False
         return False, "\n".join(errors), warnings
     
     # 3. Check for Wi-Fi interfaces
-    wifi_interfaces = get_wifi_interfaces()
     if not wifi_interfaces:
         errors.append("No Wi-Fi interfaces found. Ensure your Wi-Fi adapter is connected and recognized.")
         return False, "\n".join(errors), warnings
     
-    # 4. Determine which interface to use
-    target_iface = interface
-    if not target_iface:
-        upstream = get_upstream_interface(exclude_vpn)
-        # Smart selection: prefer interface NOT providing internet
-        for dev in wifi_interfaces:
-            if dev != upstream:
-                target_iface = dev
-                break
-        if not target_iface:
-            target_iface = wifi_interfaces[0]
+    # 4. Check for monitor mode on all WiFi interfaces
+    monitor_mode_ifaces = [i for i in wifi_interfaces if i.get('in_monitor_mode')]
+    if monitor_mode_ifaces:
+        iface_names = [i['name'] for i in monitor_mode_ifaces]
+        warnings.append(f"Interface(s) in monitor mode (cannot use for AP): {', '.join(iface_names)}")
     
-    # 5. Check if interface exists
-    if target_iface not in wifi_interfaces:
-        errors.append(f"Interface '{target_iface}' not found. Available: {', '.join(wifi_interfaces)}")
+    # 5. Determine which interface to use
+    target_iface = interface
+    target_iface_info = None
+    
+    if not target_iface:
+        # Smart selection using new logic
+        _, recommended_hotspot, _ = get_smart_interface_selection()
+        target_iface = recommended_hotspot
+    
+    # Find detailed info for target interface
+    for i in wifi_interfaces:
+        if i['name'] == target_iface:
+            target_iface_info = i
+            break
+    
+    if not target_iface:
+        errors.append(f"No suitable Wi-Fi interface found for hotspot.")
         return False, "\n".join(errors), warnings
     
-    # 6. Check interface operational state
+    if not target_iface_info:
+        wifi_names = [i['name'] for i in wifi_interfaces]
+        errors.append(f"Interface '{target_iface}' not found. Available: {', '.join(wifi_names)}")
+        return False, "\n".join(errors), warnings
+    
+    # 6. Check if target interface is in monitor mode
+    if target_iface_info.get('in_monitor_mode'):
+        errors.append(
+            f"Interface {target_iface} is in MONITOR MODE and cannot be used for Access Point.\n"
+            f"To fix: sudo iw dev {target_iface} set type managed"
+        )
+        return False, "\n".join(errors), warnings
+    
+    # 7. Check interface operational state
     iface_ok, iface_error = check_interface_state(target_iface)
     if not iface_ok:
         errors.append(iface_error)
     elif iface_error:
         warnings.append(iface_error)
     
-    # 7. Check AP mode support
-    ap_supported, ap_error = check_ap_mode_support(target_iface)
-    if not ap_supported:
-        errors.append(ap_error)
-    elif ap_error:
-        warnings.append(ap_error)
+    # 8. Check AP mode support for the specific interface
+    if not target_iface_info.get('ap_support'):
+        other_ap = [i for i in wifi_interfaces if i.get('ap_support') and not i.get('in_monitor_mode')]
+        if other_ap:
+            errors.append(
+                f"Interface {target_iface} does not support AP mode.\n"
+                f"Alternative with AP support: {other_ap[0]['label']}"
+            )
+        else:
+            errors.append(
+                f"Interface {target_iface} does not support AP (Access Point) mode.\n"
+                f"You may need a different Wi-Fi adapter that supports AP mode."
+            )
     
-    # 6. Check if interface is busy (connected to WiFi)
-    is_busy, connection_name = check_interface_busy(target_iface)
+    # 9. Check if interface is busy and analyze alternatives
+    is_busy = target_iface_info.get('connected')
+    connection_name = target_iface_info.get('connection_name')
+    
+    # Determine all available internet sources
+    connected_ethernet = [i for i in ethernet_interfaces if i.get('connected') or i.get('has_ip')]
+    connected_mobile = [i for i in mobile_interfaces if i.get('has_ip')]
+    connected_tether = [i for i in tether_interfaces if i.get('has_ip')]
+    connected_vpn = [i for i in vpn_interfaces if i.get('has_ip')]
+    connected_wifi = [i for i in wifi_interfaces if i.get('connected') and i['name'] != target_iface]
+    
+    has_alternative_internet = bool(connected_ethernet or connected_mobile or connected_tether or connected_wifi)
+    
+    # Determine internet source
     upstream = get_upstream_interface(exclude_vpn)
     
-    # Check if we have an alternative internet source (Ethernet)
-    has_ethernet_internet = False
-    if upstream and not upstream.startswith(('wl', 'wlan')):
-        # Upstream is Ethernet or similar (not WiFi)
-        has_ethernet_internet = True
-    
     if is_busy:
-        if target_iface == upstream:
+        is_internet_source = target_iface_info.get('is_internet_source') or target_iface == upstream
+        
+        if is_internet_source:
             # This WiFi interface is providing internet
-            if len(wifi_interfaces) == 1 and not has_ethernet_internet:
-                # CRITICAL: Single WiFi, no Ethernet = will lose all internet
+            ap_capable_other_wifi = [i for i in wifi_interfaces 
+                                     if i['name'] != target_iface 
+                                     and i.get('ap_support') 
+                                     and not i.get('in_monitor_mode')]
+            
+            if not has_alternative_internet and len(wifi_interfaces) == 1:
+                # CRITICAL: Single WiFi, no alternatives = will lose all internet
                 if force_single_interface:
                     warnings.append(
-                        f"FORCED: Your only Wi-Fi interface ({target_iface}) will disconnect from '{connection_name}'. "
+                        f"⚠️ FORCED: Your only Wi-Fi interface ({target_iface}) will disconnect from '{connection_name}'. "
                         f"You will lose internet connectivity. Proceed with caution."
                     )
                 else:
+                    solutions = ["Solutions:"]
+                    solutions.append("  1. Connect via Ethernet cable first")
+                    solutions.append("  2. Add a USB Wi-Fi adapter for the hotspot")
+                    solutions.append("  3. Tether your phone via USB for internet")
+                    solutions.append("  4. Use --force-single-interface flag if you understand the risk")
                     errors.append(
-                        f"BLOCKED: Your only Wi-Fi interface ({target_iface}) is currently providing your internet connection via '{connection_name}'. "
-                        f"Starting a hotspot will disconnect you completely with no way to recover remotely.\n"
-                        f"Solutions:\n"
-                        f"  1. Connect to the internet via Ethernet cable first\n"
-                        f"  2. Add a second USB Wi-Fi adapter for the hotspot\n"
-                        f"  3. Use --force-single-interface flag if you understand the risk"
+                        f"BLOCKED: Your only Wi-Fi interface ({target_iface}) is providing internet via '{connection_name}'.\n"
+                        f"Starting a hotspot will disconnect you completely.\n" + "\n".join(solutions)
                     )
-            elif len(wifi_interfaces) == 1 and has_ethernet_internet:
-                # Single WiFi but Ethernet is available - just warn
+            elif connected_ethernet:
+                # Ethernet is available - just warn about WiFi disconnection
+                eth_name = connected_ethernet[0]['name']
                 warnings.append(
                     f"Your Wi-Fi ({target_iface}) will disconnect from '{connection_name}'. "
-                    f"Internet will continue via Ethernet ({upstream})."
+                    f"Internet will continue via Ethernet ({eth_name})."
+                )
+            elif connected_mobile:
+                warnings.append(
+                    f"Your Wi-Fi ({target_iface}) will disconnect from '{connection_name}'. "
+                    f"Internet will continue via Mobile Broadband."
+                )
+            elif connected_tether:
+                warnings.append(
+                    f"Your Wi-Fi ({target_iface}) will disconnect from '{connection_name}'. "
+                    f"Internet will continue via Phone Tethering."
+                )
+            elif ap_capable_other_wifi:
+                # Suggest using the other WiFi adapter instead
+                warnings.append(
+                    f"Interface {target_iface} is providing internet. "
+                    f"Consider using {ap_capable_other_wifi[0]['label']} for hotspot instead."
                 )
             else:
                 warnings.append(
-                    f"Interface {target_iface} is connected to '{connection_name}'. It will be disconnected to start the hotspot."
+                    f"Interface {target_iface} is connected to '{connection_name}'. "
+                    f"It will be disconnected to start the hotspot."
                 )
         else:
             warnings.append(
-                f"Interface {target_iface} is connected to '{connection_name}'. It will be disconnected to start the hotspot."
+                f"Interface {target_iface} is connected to '{connection_name}'. "
+                f"It will be disconnected to start the hotspot."
             )
     
-    # 9. Check for internet connectivity
-    if not upstream:
+    # 10. Check for internet connectivity
+    if not upstream and not has_alternative_internet:
         warnings.append(
             "No active internet connection detected. Hotspot clients will not have internet access unless you connect later."
         )
     
-    # 10. Check 5GHz band support if selected
+    # 11. Check 5GHz band support if selected
     if band == 'a':  # 5GHz
-        ghz5_ok, ghz5_error = check_5ghz_support()
-        if not ghz5_ok:
-            errors.append(ghz5_error)
+        if not target_iface_info.get('supports_5ghz'):
+            errors.append(
+                f"Interface {target_iface} does not support 5GHz band.\n"
+                f"Use 2.4GHz band instead, or use a 5GHz-capable adapter."
+            )
     
-    # 8. Validate SSID
+    # 12. Validate SSID
     if ssid:
         if len(ssid) < 1 or len(ssid) > 32:
             errors.append("SSID must be between 1 and 32 characters.")
         if any(ord(c) > 127 for c in ssid):
             warnings.append("SSID contains non-ASCII characters. Some devices may not display it correctly.")
     
-    # 9. Validate password
+    # 13. Validate password
     if password:
         if len(password) < 8:
             errors.append("Password must be at least 8 characters for WPA2 security.")
         elif len(password) > 63:
             errors.append("Password must not exceed 63 characters.")
     
-    # 10. Check for conflicting hotspot processes
+    # 14. Check for conflicting hotspot processes
     try:
         result = subprocess.run(['pgrep', '-f', 'hotspot_backend.py'], capture_output=True, text=True)
         if result.stdout.strip():
@@ -575,18 +847,20 @@ def preflight_checks(interface=None, ssid=None, password=None, exclude_vpn=False
     except:
         pass
     
-    # 11. Check for existing hotspot connection
-    try:
-        output = run_command(['nmcli', '-t', '-f', 'NAME', 'con', 'show'], check=False)
-        if output and CONNECTION_NAME in output:
-            pass  # Will be cleaned up, not an error
-    except:
-        pass
+    # 15. Check for interface issues
+    if target_iface_info.get('issues'):
+        for issue in target_iface_info['issues']:
+            if 'No AP' in issue:
+                pass  # Already handled above
+            else:
+                warnings.append(f"Interface issue: {issue}")
     
     if errors:
         return False, "\n".join(errors), warnings
     
     return True, None, warnings
+
+
 
 
 
