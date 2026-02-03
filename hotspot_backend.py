@@ -189,6 +189,11 @@ def get_detailed_interfaces():
                 # Check 5GHz support
                 iface_info['supports_5ghz'] = check_5ghz_support_for_iface(dev_name)
                 
+                # Check STA/AP concurrency support
+                supports_concurrency, concurrency_channels = check_sta_ap_concurrency(dev_name)
+                iface_info['supports_concurrency'] = supports_concurrency
+                iface_info['concurrency_channels'] = concurrency_channels
+                
                 # Check if in monitor mode
                 try:
                     iw_info = subprocess.run(['iw', 'dev', dev_name, 'info'], 
@@ -267,6 +272,83 @@ def get_all_internet_sources():
     sources.sort(key=lambda x: x['priority'], reverse=True)
     return sources
 
+
+def check_sta_ap_concurrency(iface):
+    """
+    Check if a WiFi interface supports STA/AP concurrency (simultaneous client + hotspot).
+    
+    This parses the 'valid interface combinations' from iw phy output.
+    A card supports concurrency if it shows:
+        #{ managed } <= 1, #{ AP } <= 1
+    or similar with both managed (STA) and AP in the same combination.
+    
+    Returns: (supports_concurrency: bool, max_channels: int or None)
+    """
+    try:
+        # Get the phy name for this interface
+        phy_result = subprocess.run(
+            ['iw', 'dev', iface, 'info'],
+            capture_output=True, text=True, timeout=5
+        )
+        if phy_result.returncode != 0:
+            return False, None
+        
+        phy_name = None
+        for line in phy_result.stdout.splitlines():
+            if 'wiphy' in line:
+                parts = line.split()
+                for i, p in enumerate(parts):
+                    if p == 'wiphy':
+                        phy_name = f"phy{parts[i+1]}"
+                        break
+        
+        if not phy_name:
+            return False, None
+        
+        # Get phy info with interface combinations
+        phy_info = subprocess.run(['iw', phy_name, 'info'], capture_output=True, text=True, timeout=5)
+        if phy_info.returncode != 0:
+            return False, None
+        
+        # Parse valid interface combinations
+        in_combinations = False
+        current_combo = ""
+        max_channels = 1
+        
+        for line in phy_info.stdout.splitlines():
+            if 'valid interface combinations:' in line.lower():
+                in_combinations = True
+                continue
+            
+            if in_combinations:
+                # End of combinations section
+                if line.strip() and not line.startswith('\t') and not line.startswith(' '):
+                    break
+                
+                # Accumulate combination lines
+                current_combo += " " + line.strip()
+                
+                # Check for channels info
+                if '#channels' in line:
+                    match = re.search(r'#channels\s*<=\s*(\d+)', line)
+                    if match:
+                        max_channels = max(max_channels, int(match.group(1)))
+        
+        # Check if combination allows both managed (STA) and AP
+        # Look for patterns like: #{ managed } <= N ... #{ AP ... } <= M
+        has_managed = bool(re.search(r'#\{\s*managed\s*\}', current_combo, re.IGNORECASE))
+        has_ap = bool(re.search(r'#\{[^}]*AP[^}]*\}', current_combo, re.IGNORECASE))
+        
+        # Also check total count allows 2+
+        total_match = re.search(r'total\s*<=\s*(\d+)', current_combo)
+        total_ok = total_match and int(total_match.group(1)) >= 2
+        
+        supports_concurrency = has_managed and has_ap and total_ok
+        
+        return supports_concurrency, max_channels if supports_concurrency else None
+        
+    except Exception as e:
+        return False, None
 
 
 def check_ap_mode_support_for_iface(iface):
@@ -379,6 +461,8 @@ def generate_interface_label(iface_info):
             caps.append("AP")
         if iface_info.get('supports_5ghz'):
             caps.append("5GHz")
+        if iface_info.get('supports_concurrency'):
+            caps.append("STA+AP")
         if iface_info.get('in_monitor_mode'):
             caps.append("⚠️Monitor")
         if caps:
@@ -482,12 +566,39 @@ def get_smart_interface_selection():
     if monitor_mode_ifaces:
         warnings.append(f"{monitor_mode_ifaces[0]['name']} is in monitor mode (cannot use for AP)")
     
+    # Filter for concurrency-capable WiFi
+    concurrent_wifi = [i for i in wifi_ifaces if i.get('supports_concurrency') and i.get('ap_support') and not i.get('in_monitor_mode')]
+    
+    # NEW Priority 0: Concurrency-capable WiFi that is providing internet
+    # This is the OPTIMAL case - same adapter does both STA (client) and AP (hotspot)
+    concurrent_and_connected = [i for i in concurrent_wifi if i.get('connected')]
+    
+    if concurrent_and_connected and internet_iface in [i['name'] for i in concurrent_and_connected]:
+        # Use the same adapter for both - this is ideal!
+        candidate = [i for i in concurrent_and_connected if i['name'] == internet_iface][0]
+        hotspot_iface = candidate['name']
+        channels = candidate.get('concurrency_channels', 1)
+        if channels >= 2:
+            reason += f" | 🎯 Same WiFi for hotspot (STA+AP concurrent, {channels} channels)"
+        else:
+            reason += " | 🎯 Same WiFi for hotspot (STA+AP concurrent, same channel)"
+    
     # Priority 1: USB WiFi adapter with AP support
-    if usb_wifi:
+    elif usb_wifi:
         hotspot_iface = usb_wifi[0]['name']
         reason += " | 🔌 USB adapter for hotspot"
     
-    # Priority 2: Internal WiFi NOT being used for internet
+    # Priority 2: Concurrency-capable internal WiFi (even if connected)
+    elif concurrent_wifi:
+        candidate = concurrent_wifi[0]
+        hotspot_iface = candidate['name']
+        if candidate.get('connected'):
+            channels = candidate.get('concurrency_channels', 1)
+            reason += f" | 🎯 Built-in WiFi (STA+AP concurrent)"
+        else:
+            reason += " | 📶 Built-in WiFi for hotspot"
+    
+    # Priority 3: Internal WiFi NOT being used for internet (legacy - no concurrency)
     elif internal_wifi:
         internal_with_ap = [i for i in internal_wifi if i.get('ap_support')]
         if internal_with_ap:
@@ -497,7 +608,7 @@ def get_smart_interface_selection():
             # Check if this is also the internet source
             if candidate['name'] == internet_iface:
                 if len(wifi_ifaces) == 1 and not connected_ethernet and not mobile_ifaces and not tether_ifaces:
-                    # Critical: only one WiFi and it's providing internet
+                    # Critical: only one WiFi, no concurrency, and it's providing internet
                     reason = "⚠️ SINGLE ADAPTER: Will disconnect from current network"
                     warnings.append("Your only WiFi will switch from client to AP mode")
                 else:
@@ -505,7 +616,7 @@ def get_smart_interface_selection():
             else:
                 reason += " | 📶 Built-in WiFi for hotspot"
     
-    # Priority 3: Any AP-capable WiFi
+    # Priority 4: Any AP-capable WiFi
     elif ap_capable_wifi:
         hotspot_iface = ap_capable_wifi[0]['name']
         reason += " | 📶 WiFi for hotspot"
@@ -745,6 +856,9 @@ def preflight_checks(interface=None, ssid=None, password=None, exclude_vpn=False
     
     has_alternative_internet = bool(connected_ethernet or connected_mobile or connected_tether or connected_wifi)
     
+    # Check if this adapter supports STA/AP concurrency
+    supports_concurrency = target_iface_info.get('supports_concurrency', False)
+    
     # Determine internet source
     upstream = get_upstream_interface(exclude_vpn)
     
@@ -758,8 +872,21 @@ def preflight_checks(interface=None, ssid=None, password=None, exclude_vpn=False
                                      and i.get('ap_support') 
                                      and not i.get('in_monitor_mode')]
             
-            if not has_alternative_internet and len(wifi_interfaces) == 1:
-                # CRITICAL: Single WiFi, no alternatives = will lose all internet
+            # NEW: If adapter supports STA/AP concurrency, no disconnection will occur
+            if supports_concurrency:
+                channels = target_iface_info.get('concurrency_channels', 1)
+                if channels >= 2:
+                    warnings.append(
+                        f"🎯 STA+AP Concurrent Mode: WiFi stays connected to '{connection_name}' "
+                        f"while hosting hotspot ({channels} channels available)."
+                    )
+                else:
+                    warnings.append(
+                        f"🎯 STA+AP Concurrent Mode: WiFi stays connected to '{connection_name}' "
+                        f"while hosting hotspot (same channel required)."
+                    )
+            elif not has_alternative_internet and len(wifi_interfaces) == 1:
+                # CRITICAL: Single WiFi, no concurrency, no alternatives = will lose all internet
                 if force_single_interface:
                     warnings.append(
                         f"⚠️ FORCED: Your only Wi-Fi interface ({target_iface}) will disconnect from '{connection_name}'. "
@@ -804,9 +931,15 @@ def preflight_checks(interface=None, ssid=None, password=None, exclude_vpn=False
                     f"It will be disconnected to start the hotspot."
                 )
         else:
-            warnings.append(
-                f"Interface {target_iface} is connected to '{connection_name}'. "
-                f"It will be disconnected to start the hotspot."
+            # Connected but not providing internet - still warn unless concurrent
+            if supports_concurrency:
+                warnings.append(
+                    f"🎯 STA+AP Concurrent Mode: Connection to '{connection_name}' will be maintained."
+                )
+            else:
+                warnings.append(
+                    f"Interface {target_iface} is connected to '{connection_name}'. "
+                    f"It will be disconnected to start the hotspot."
             )
     
     # 10. Check for internet connectivity
