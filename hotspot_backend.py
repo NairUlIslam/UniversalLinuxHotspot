@@ -1347,24 +1347,28 @@ def get_upstream_interface(exclude_vpn=False):
     return None
 
 def get_smart_interface(exclude_vpn=False):
-    """Selects the best available Wi-Fi interface, avoiding the upstream source."""
+    """Selects the best available Wi-Fi interface for hotspot."""
+    # Use the sophisticated selection logic which prioritizes USB adapters
+    _, hotspot_iface, reason = get_smart_interface_selection()
+    
+    if hotspot_iface:
+        print(f"Smart Select: {reason}")
+        return hotspot_iface
+    
+    # Fallback to legacy method if sophisticated selection returns nothing
     wifi_devs = get_wifi_interfaces()
     if not wifi_devs: return None
     
     upstream = get_upstream_interface(exclude_vpn)
-    print(f"Detected Upstream (Internet) Interface: {upstream}")
-    
     candidates = []
-    # prioritizing disconnected devices to avoid conflict
+    # prioritising disconnected devices to avoid conflict
     for dev in wifi_devs:
         if dev != upstream:
             candidates.append(dev)
             
     if candidates:
-        print(f"Smart Select: Chose {candidates[0]} (avoided {upstream})")
         return candidates[0]
     
-    print(f"Warning: Only available Wi-Fi interface is the upstream source ({upstream}). Connection might drop.")
     return wifi_devs[0]
 
 def count_connected_clients(iface):
