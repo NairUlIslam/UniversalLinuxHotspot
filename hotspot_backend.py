@@ -798,12 +798,13 @@ def generate_interface_label(iface_info):
     
     return " ".join(parts)
 
-def get_smart_interface_selection():
+def get_smart_interface_selection(manual_internet_iface=None):
     """
     Intelligently select which interface should be used for internet and which for hotspot.
     Returns: (internet_iface, hotspot_iface, reason)
     
     Priority for Internet Source:
+    0. Manual override (if provided)
     1. Ethernet (wired) - most stable
     2. Mobile broadband (wwan)
     3. Phone tethering (usb0)
@@ -840,8 +841,12 @@ def get_smart_interface_selection():
     
     # === DETERMINE INTERNET SOURCE ===
     
+    if manual_internet_iface:
+        internet_iface = manual_internet_iface
+        reason = f"👤 Manually selected internet source: {manual_internet_iface}"
+    
     # Priority 1: Ethernet with IP
-    if connected_ethernet:
+    elif connected_ethernet:
         best_eth = connected_ethernet[0]
         internet_iface = best_eth['name']
         if best_eth.get('is_usb'):
@@ -1346,10 +1351,10 @@ def get_upstream_interface(exclude_vpn=False):
     except: pass
     return None
 
-def get_smart_interface(exclude_vpn=False):
+def get_smart_interface(exclude_vpn=False, manual_internet_iface=None):
     """Selects the best available Wi-Fi interface for hotspot."""
     # Use the sophisticated selection logic which prioritizes USB adapters
-    _, hotspot_iface, reason = get_smart_interface_selection()
+    _, hotspot_iface, reason = get_smart_interface_selection(manual_internet_iface)
     
     if hotspot_iface:
         print(f"Smart Select: {reason}")
@@ -1472,6 +1477,7 @@ def main():
     parser.add_argument('--exclude-vpn', action='store_true', help='Avoid routing through VPN interfaces')
     parser.add_argument('--force-single-interface', action='store_true', 
                         help='Force hotspot on single WiFi interface even if it will disconnect internet')
+    parser.add_argument('--internet-interface', help='Explicitly set upstream internet interface')
     parser.add_argument('--stop', action='store_true')
     
     args = parser.parse_args()
@@ -1580,8 +1586,8 @@ def main():
         HOTSPOT_IFACE = args.interface
         physical_iface = args.interface
     else:
-        # Use new smart selector
-        HOTSPOT_IFACE = get_smart_interface(EXCLUDE_VPN)
+        # Use new smart selector with manual internet interface if provided
+        HOTSPOT_IFACE = get_smart_interface(EXCLUDE_VPN, manual_internet_iface=args.internet_interface)
         physical_iface = HOTSPOT_IFACE
         if not HOTSPOT_IFACE:
             print("Error: No Wi-Fi interfaces found.")
@@ -1603,7 +1609,10 @@ def main():
     
     # Check if we're using a SEPARATE adapter for hotspot (dual-adapter mode)
     # In dual-adapter mode, NO regulatory restrictions apply - each adapter is independent
-    internet_iface = get_upstream_interface(EXCLUDE_VPN)
+    if args.internet_interface:
+        internet_iface = args.internet_interface
+    else:
+        internet_iface = get_upstream_interface(EXCLUDE_VPN)
     using_separate_adapter = internet_iface and internet_iface != physical_iface
     
     if using_separate_adapter:

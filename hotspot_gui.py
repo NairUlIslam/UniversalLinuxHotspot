@@ -802,6 +802,7 @@ class HotspotTray(QSystemTrayIcon):
                    "--band", s.get("band") or "bg", "--auto-off", str(s.get("auto_off") or 0),
                    "--mac-mode", s.get("mac_mode") or "block"]
             if s.get("interface"): cmd.extend(["--interface", s.get("interface")])
+            if s.get("internet_interface"): cmd.extend(["--internet-interface", s.get("internet_interface")])
             if s.get("hidden"): cmd.append("--hidden")
             
             # Check for VPN Routing
