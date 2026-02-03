@@ -1647,10 +1647,10 @@ def main():
             # Determine upstream interface for NAT (the STA connection)
             upstream = physical_iface
             
-            # Generate configs with regulatory bypass settings
+            # Generate configs with regulatory settings
             generate_hostapd_config(virtual_iface, args.ssid, args.password, 
                                    channel=channel, band=args.band, hidden=args.hidden,
-                                   country_code='US')  # US has more permissive 5GHz rules
+                                   country_code='IN')  # India regulatory domain
             dnsmasq_conf, gateway_ip = generate_dnsmasq_config(virtual_iface, args.dns)
             
             # Setup network

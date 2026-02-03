@@ -65,6 +65,16 @@ Right-click the tray icon for instant access to:
 - **Auto-Detection**: The application parses `iw phy` output to detect `valid interface combinations`.
 - **Multi-Channel Support**: Displays whether concurrent operation uses same channel or separate channels.
 - **Labels**: Capable interfaces show `[AP, 5GHz, STA+AP]` in the interface list.
+- **hostapd-based**: Uses `hostapd` and `dnsmasq` for reliable concurrent mode operation.
+- **Virtual Interface**: Creates a virtual AP interface (e.g., `wlan0_ap`) for the hotspot while keeping the physical interface connected.
+- **Automatic NAT**: Sets up IP forwarding and NAT rules automatically for seamless internet sharing.
+
+### 🔌 **Dual Adapter Mode**
+When using a separate WiFi adapter for the hotspot (e.g., USB WiFi dongle):
+- **No Regulatory Restrictions**: Each adapter operates independently.
+- **Any Channel/Band**: Hotspot can use any channel regardless of connected network.
+- **Automatic Detection**: App detects when internet comes from a different interface than the hotspot adapter.
+- **Optimal Performance**: Dedicated hotspot adapter provides better performance.
 
 ### ⏱️ **Convenience Features**
 - Auto-off timer (1-120 minutes)
@@ -91,6 +101,11 @@ Right-click the tray icon for instant access to:
 - `iw` - Wireless interface configuration
 - `iptables` - Firewall/NAT rules
 - `rfkill` - RF switch management
+
+### System Tools (Auto-installed for STA+AP Concurrent Mode)
+- `hostapd` - Access Point daemon for concurrent mode
+- `dnsmasq` - DHCP server for hotspot clients
+- *Note: These are automatically installed by `install.sh` on Debian/Ubuntu, Fedora/RHEL, and Arch Linux*
 
 ---
 
@@ -240,6 +255,14 @@ The app shows detailed labels for each interface:
 | **Single adapter + WiFi internet** | Would disconnect you completely | `--force-single-interface` flag |
 | **No AP support** | Hardware limitation | Use compatible adapter |
 | **Monitor mode** | Cannot run AP in monitor mode | Set interface to managed mode |
+
+### 🔄 Concurrent Mode Troubleshooting
+
+| Issue | Reason | Solution |
+|-------|--------|----------|
+| **5GHz NO-IR Restriction** | Regulatory domains often block 5GHz AP initiation on specific channels | 1. Connect to a 2.4GHz network instead<br>2. Use a second USB WiFi adapter<br>3. App attempts automatic regulatory bypass (US/IN) |
+| **Virtual Interface Fail** | WiFi driver doesn't support concurrent virtual interfaces | Use standard mode or a second adapter |
+| **hostapd Failed** | Channel mismatch or driver rejection | Check logs. Ensure STA and AP are on same channel/band if using one adapter. |
 
 ---
 
