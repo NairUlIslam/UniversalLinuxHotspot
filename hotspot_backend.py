@@ -18,6 +18,8 @@ CURRENT_UPSTREAM_IFACE = None
 MAC_MODE = "block" # or "allow"
 MAC_LIST = []
 EXCLUDE_VPN = False
+VIRTUAL_AP_IFACE = None  # Virtual interface for STA+AP concurrency
+USING_CONCURRENCY = False  # Whether we're using concurrent mode
 
 def run_command(command, check=True):
     try:
@@ -46,6 +48,62 @@ def ensure_wifi_active(iface):
             return
         time.sleep(1)
     print(f"Warning: Interface {iface} is still not fully ready, but proceeding...")
+
+def create_virtual_ap_interface(physical_iface):
+    """
+    Create a virtual AP interface for STA+AP concurrent mode.
+    This allows the physical interface to stay connected to WiFi
+    while the virtual interface runs the hotspot.
+    
+    Returns: virtual_iface_name or None on failure
+    """
+    virtual_iface = f"{physical_iface}_ap"
+    
+    # Check if it already exists
+    result = subprocess.run(['ip', 'link', 'show', virtual_iface], 
+                           capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f"Virtual interface {virtual_iface} already exists, removing first...")
+        delete_virtual_ap_interface(physical_iface)
+    
+    # Create the virtual AP interface using iw
+    print(f"Creating virtual AP interface: {virtual_iface}")
+    result = subprocess.run(
+        ['iw', 'dev', physical_iface, 'interface', 'add', virtual_iface, 'type', '__ap'],
+        capture_output=True, text=True
+    )
+    
+    if result.returncode != 0:
+        print(f"Failed to create virtual interface: {result.stderr}")
+        return None
+    
+    # Bring the interface up
+    subprocess.run(['ip', 'link', 'set', virtual_iface, 'up'], check=False)
+    
+    # Give it a moment to initialize
+    time.sleep(0.5)
+    
+    # Verify it was created
+    result = subprocess.run(['ip', 'link', 'show', virtual_iface], 
+                           capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f"Virtual AP interface {virtual_iface} created successfully")
+        return virtual_iface
+    else:
+        print(f"Virtual interface creation verification failed")
+        return None
+
+def delete_virtual_ap_interface(physical_iface):
+    """Delete the virtual AP interface if it exists."""
+    virtual_iface = f"{physical_iface}_ap"
+    
+    result = subprocess.run(['ip', 'link', 'show', virtual_iface], 
+                           capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f"Removing virtual interface: {virtual_iface}")
+        subprocess.run(['iw', 'dev', virtual_iface, 'del'], check=False)
+        return True
+    return False
 
 def get_wifi_interfaces():
     """Legacy function for backward compatibility."""
@@ -1109,28 +1167,28 @@ def update_firewall(hotspot_iface, upstream_iface):
             ], check=False)
 
 def cleanup(signal_received=None, frame=None):
+    global VIRTUAL_AP_IFACE, USING_CONCURRENCY, HOTSPOT_IFACE
     print("\n\nStopping hotspot...")
     
-    # 1. Clean Firewall (Aggressive)
-    # We messed with FORWARD, so flush it or delete our rules. Flushing is safer for "Stop" state.
-    # But flushing FORWARD might kill Docker/Other rules? 
-    # Better: explicitly delete the rules we added. But simpler for user fixes: Flush specific rules.
-    # Actually, let's just reverse the insertions.
-    
-    # Simple Reset:
+    # 1. Clean Firewall
     run_command(['iptables', '-t', 'nat', '-F', 'POSTROUTING'], check=False)
-    # Flush FORWARD is risky if user has other stuff... 
-    # But sticking to "Original File" simplicity: The original file didn't spam FORWARD insertions.
-    # We should delete the rules matching our interfaces.
-    
-    # Generic delete attempt for our common rules
     run_command(['iptables', '-D', 'FORWARD', '-p', 'tcp', '--tcp-flags', 'SYN,RST', 'SYN', '-j', 'TCPMSS', '--clamp-mss-to-pmtu'], check=False)
     run_command(['iptables', '-D', 'FORWARD', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT'], check=False)
     
-    # Reverting Connection
+    # 2. Delete the hotspot connection
     run_command(['nmcli', 'con', 'delete', CONNECTION_NAME], check=False)
     
-    # Kill PID file
+    # 3. Clean up virtual interface if we were using concurrent mode
+    if USING_CONCURRENCY and VIRTUAL_AP_IFACE:
+        print(f"Cleaning up virtual interface: {VIRTUAL_AP_IFACE}")
+        subprocess.run(['iw', 'dev', VIRTUAL_AP_IFACE, 'del'], check=False)
+        VIRTUAL_AP_IFACE = None
+        USING_CONCURRENCY = False
+    elif HOTSPOT_IFACE:
+        # Also try to clean up any orphaned virtual interfaces
+        delete_virtual_ap_interface(HOTSPOT_IFACE)
+    
+    # 4. Kill PID file
     if os.path.exists(PID_FILE): os.remove(PID_FILE)
     sys.exit(0)
 
@@ -1202,7 +1260,17 @@ def main():
         run_command(['iptables', '-D', 'FORWARD', '-p', 'tcp', '--tcp-flags', 'SYN,RST', 'SYN', '-j', 'TCPMSS', '--clamp-mss-to-pmtu'], check=False)
         run_command(['iptables', '-D', 'FORWARD', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT'], check=False)
         
-        # 5. Remove PID file
+        # 5. Clean up any virtual AP interfaces (for STA+AP concurrent mode)
+        wifi_interfaces = get_wifi_interfaces()
+        for iface in wifi_interfaces:
+            virtual_iface = f"{iface}_ap"
+            result = subprocess.run(['ip', 'link', 'show', virtual_iface], 
+                                   capture_output=True, text=True)
+            if result.returncode == 0:
+                print(f"Cleaning up virtual interface: {virtual_iface}")
+                subprocess.run(['iw', 'dev', virtual_iface, 'del'], check=False)
+        
+        # 6. Remove PID file
         if os.path.exists(PID_FILE): os.remove(PID_FILE)
         
         print("Hotspot stopped.")
@@ -1242,26 +1310,66 @@ def main():
     with open(PID_FILE, 'w') as f: f.write(str(os.getpid()))
     signal.signal(signal.SIGINT, cleanup); signal.signal(signal.SIGTERM, cleanup)
 
-    # SMART SELECTION LOGIC
+    # SMART SELECTION LOGIC with STA+AP Concurrency Support
+    physical_iface = None
+    actual_hotspot_iface = None  # The interface we'll actually use for the hotspot
+    
     if args.interface: 
         HOTSPOT_IFACE = args.interface
+        physical_iface = args.interface
     else:
         # Use new smart selector
         HOTSPOT_IFACE = get_smart_interface(EXCLUDE_VPN)
+        physical_iface = HOTSPOT_IFACE
         if not HOTSPOT_IFACE:
             print("Error: No Wi-Fi interfaces found.")
             cleanup()
     
     print(f"Selected Hotspot Interface: {HOTSPOT_IFACE}")
-    ensure_wifi_active(HOTSPOT_IFACE)
-    run_command(['nmcli', 'device', 'disconnect', HOTSPOT_IFACE], check=False)
+    
+    # Check if this interface supports STA+AP concurrency AND is currently connected
+    all_ifaces = get_detailed_interfaces()
+    target_iface_info = None
+    for iface in all_ifaces:
+        if iface['name'] == physical_iface:
+            target_iface_info = iface
+            break
+    
+    supports_concurrency = target_iface_info and target_iface_info.get('supports_concurrency', False)
+    is_connected = target_iface_info and target_iface_info.get('connected', False)
+    
+    if supports_concurrency and is_connected:
+        # === STA+AP CONCURRENT MODE ===
+        print(f"🎯 Using STA+AP Concurrent Mode - WiFi connection will be preserved!")
+        connection_name = target_iface_info.get('connection_name', 'current network')
+        print(f"   Maintaining connection to: {connection_name}")
+        
+        # Create virtual AP interface
+        virtual_iface = create_virtual_ap_interface(physical_iface)
+        if virtual_iface:
+            VIRTUAL_AP_IFACE = virtual_iface
+            USING_CONCURRENCY = True
+            actual_hotspot_iface = virtual_iface
+            print(f"   Hotspot will run on virtual interface: {virtual_iface}")
+        else:
+            print(f"⚠️ Failed to create virtual interface, falling back to standard mode")
+            print(f"   WiFi will be disconnected to start hotspot")
+            actual_hotspot_iface = physical_iface
+            ensure_wifi_active(physical_iface)
+            run_command(['nmcli', 'device', 'disconnect', physical_iface], check=False)
+    else:
+        # === STANDARD MODE (non-concurrent) ===
+        actual_hotspot_iface = physical_iface
+        ensure_wifi_active(physical_iface)
+        run_command(['nmcli', 'device', 'disconnect', physical_iface], check=False)
+    
+    # Clean up any existing hotspot connection
     run_command(['nmcli', 'con', 'delete', CONNECTION_NAME], check=False)
 
-
     try:
-        print(f"Creating Hotspot '{args.ssid}'...")
+        print(f"Creating Hotspot '{args.ssid}' on {actual_hotspot_iface}...")
         run_command([
-            'nmcli', 'con', 'add', 'type', 'wifi', 'ifname', HOTSPOT_IFACE, 
+            'nmcli', 'con', 'add', 'type', 'wifi', 'ifname', actual_hotspot_iface, 
             'con-name', CONNECTION_NAME, 'autoconnect', 'no', 
             'ssid', args.ssid, 'mode', 'ap', '802-11-wireless.band', args.band
         ])
@@ -1277,9 +1385,16 @@ def main():
             run_command(['nmcli', 'con', 'modify', CONNECTION_NAME, 'ipv4.ignore-auto-dns', 'yes'])
 
         print("Activating hotspot...")
-        run_command(['nmcli', 'con', 'up', CONNECTION_NAME, 'ifname', HOTSPOT_IFACE])
-        print(f"\nHotspot ACTIVE on {HOTSPOT_IFACE}")
-        write_status("active", f"Hotspot '{args.ssid}' is now active on {HOTSPOT_IFACE}")
+        run_command(['nmcli', 'con', 'up', CONNECTION_NAME, 'ifname', actual_hotspot_iface])
+        
+        if USING_CONCURRENCY:
+            print(f"\n🎯 Hotspot ACTIVE on {actual_hotspot_iface} (STA+AP Concurrent Mode)")
+            print(f"   WiFi connection preserved on {physical_iface}")
+            write_status("active", f"Hotspot '{args.ssid}' active (STA+AP mode) - WiFi preserved")
+        else:
+            print(f"\nHotspot ACTIVE on {actual_hotspot_iface}")
+            write_status("active", f"Hotspot '{args.ssid}' is now active on {actual_hotspot_iface}")
+        
         print("Monitoring internet source...")
 
         idle_seconds = 0
@@ -1290,8 +1405,9 @@ def main():
             new_upstream = get_upstream_interface(EXCLUDE_VPN)
             
             if new_upstream and new_upstream != CURRENT_UPSTREAM_IFACE:
-                if new_upstream != HOTSPOT_IFACE:
-                    update_firewall(HOTSPOT_IFACE, new_upstream)
+                # In concurrent mode, the upstream is the physical interface itself
+                if new_upstream != actual_hotspot_iface:
+                    update_firewall(actual_hotspot_iface, new_upstream)
                     CURRENT_UPSTREAM_IFACE = new_upstream
             
             # Auto-off check: only check clients every 5 seconds to reduce overhead
@@ -1299,7 +1415,7 @@ def main():
                 check_counter += 1
                 if check_counter >= 5:  # Every 5 seconds
                     check_counter = 0
-                    clients = count_connected_clients(HOTSPOT_IFACE)
+                    clients = count_connected_clients(actual_hotspot_iface)
                     if clients == 0: 
                         idle_seconds += 5
                     else: 
