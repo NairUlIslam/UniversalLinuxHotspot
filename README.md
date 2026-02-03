@@ -60,6 +60,12 @@ Right-click the tray icon for instant access to:
 - **Interface Locking**: Securely bind the internet source to your VPN interface (e.g., `tun0`, `wg0`).
 - **DNS Leak Protection**: Support for custom DNS servers to prevent ISP DNS sniffing.
 
+### 🔄 **STA/AP Concurrency (Simultaneous WiFi + Hotspot)**
+- **No Disconnection Required**: If your WiFi adapter supports STA/AP concurrency, stay connected to your home network while broadcasting a hotspot.
+- **Auto-Detection**: The application parses `iw phy` output to detect `valid interface combinations`.
+- **Multi-Channel Support**: Displays whether concurrent operation uses same channel or separate channels.
+- **Labels**: Capable interfaces show `[AP, 5GHz, STA+AP]` in the interface list.
+
 ### ⏱️ **Convenience Features**
 - Auto-off timer (1-120 minutes)
 - Automatic startup on login
@@ -186,12 +192,19 @@ The app shows detailed labels for each interface:
 - Internet Source: 📶 Built-in Wi-Fi (for regular connection)
 - Hotspot Interface: 🔌 USB Wi-Fi Adapter
 
-#### Scenario 3: Single Wi-Fi Only (No Ethernet)
+#### Scenario 3: Single Wi-Fi with STA/AP Concurrency Support
+**Optimal Setup** ✅ (No disconnection!)
+- The app detects `[STA+AP]` capability
+- Same adapter maintains WiFi connection AND broadcasts hotspot
+- Internet Source: 📶 Built-in Wi-Fi (stays connected)
+- Hotspot Interface: 📶 Same Built-in Wi-Fi (concurrent AP mode)
+
+#### Scenario 4: Single Wi-Fi WITHOUT Concurrency
 **⚠️ Risky** - Starting hotspot will disconnect you!
 - The app will **block** this by default
 - Use `--force-single-interface` flag to override (advanced users)
 
-#### Scenario 4: Mobile Broadband / Phone Tethering
+#### Scenario 5: Mobile Broadband / Phone Tethering
 **Works great** ✅
 - Internet Source: 📱 Mobile Broadband / Phone Tethering
 - Hotspot Interface: 📶 Any Wi-Fi with AP support
