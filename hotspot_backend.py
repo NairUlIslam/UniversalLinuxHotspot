@@ -140,15 +140,72 @@ def get_wifi_channel(iface):
         pass
     return 6  # Default to channel 6
 
-def generate_hostapd_config(iface, ssid, password, channel=6, band='bg', hidden=False):
-    """Generate hostapd configuration file."""
+def check_5ghz_ap_allowed(channel):
+    """
+    Check if 5GHz AP mode is allowed on the given channel.
+    Returns: (allowed: bool, reason: str)
+    """
+    if channel <= 14:
+        return True, "2.4GHz channel"
+    
+    try:
+        # Get regulatory info
+        result = subprocess.run(['iw', 'phy', 'phy0', 'channels'], 
+                               capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            lines = result.stdout.splitlines()
+            for i, line in enumerate(lines):
+                # Find the channel line
+                if f'[{channel}]' in line:
+                    # Check if NO-IR flag is present
+                    if 'No IR' in line or 'NO-IR' in line:
+                        return False, f"Channel {channel} has NO-IR (No Initiate Radiation) restriction"
+                    return True, f"Channel {channel} allowed"
+    except:
+        pass
+    
+    return True, "Unable to verify, assuming allowed"
+
+def attempt_regulatory_bypass():
+    """
+    Attempt to set a permissive regulatory domain for 5GHz AP.
+    Returns: bool indicating if bypass was attempted
+    """
+    try:
+        # Try setting US regulatory domain (more permissive for 5GHz)
+        subprocess.run(['iw', 'reg', 'set', 'US'], check=False, capture_output=True)
+        time.sleep(0.3)
+        return True
+    except:
+        return False
+
+def generate_hostapd_config(iface, ssid, password, channel=6, band='bg', hidden=False, country_code='US'):
+    """Generate hostapd configuration file with regulatory settings."""
     # Determine hardware mode based on band and channel
     if band == 'a' or channel > 14:
         hw_mode = 'a'
+        # For 5GHz, add regulatory settings to try bypassing NO-IR
+        config = f"""# Hotspot hostapd configuration
+interface={iface}
+driver=nl80211
+ssid={ssid}
+country_code={country_code}
+ieee80211d=1
+ieee80211h=1
+hw_mode={hw_mode}
+channel={channel}
+wmm_enabled=1
+macaddr_acl=0
+auth_algs=1
+ignore_broadcast_ssid={'1' if hidden else '0'}
+wpa=2
+wpa_passphrase={password}
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+"""
     else:
         hw_mode = 'g'
-    
-    config = f"""# Hotspot hostapd configuration
+        config = f"""# Hotspot hostapd configuration
 interface={iface}
 driver=nl80211
 ssid={ssid}
@@ -167,6 +224,7 @@ rsn_pairwise=CCMP
     
     with open(HOSTAPD_CONF, 'w') as f:
         f.write(config)
+
     
     return HOSTAPD_CONF
 
@@ -1545,6 +1603,23 @@ def main():
         connection_name = target_iface_info.get('connection_name', 'current network')
         print(f"   Maintaining connection to: {connection_name}")
         
+        # Get the channel from the physical interface (must use same channel for concurrent mode)
+        channel = get_wifi_channel(physical_iface)
+        print(f"   STA channel: {channel}")
+        
+        # Check if 5GHz AP is allowed on this channel
+        ap_allowed, reason = check_5ghz_ap_allowed(channel)
+        if not ap_allowed:
+            print(f"⚠️ 5GHz AP restriction detected: {reason}")
+            print("   Attempting regulatory bypass...")
+            attempt_regulatory_bypass()
+            # Re-check after bypass attempt
+            ap_allowed, reason = check_5ghz_ap_allowed(channel)
+            if not ap_allowed:
+                print(f"   ⚠️ NOTICE: 5GHz channel {channel} has regulatory restrictions (NO-IR).")
+                print("   The hotspot may not work on 5GHz. Consider connecting to a 2.4GHz network.")
+                write_status("warning", f"5GHz restriction: {reason}. Attempting anyway...")
+        
         # Create virtual AP interface
         virtual_iface = create_virtual_ap_interface(physical_iface)
         if virtual_iface:
@@ -1553,18 +1628,19 @@ def main():
             actual_hotspot_iface = virtual_iface
             print(f"   Hotspot will run on virtual interface: {virtual_iface}")
             
-            # Get the channel from the physical interface (must use same channel for concurrent mode)
-            channel = get_wifi_channel(physical_iface)
-            print(f"   Using channel {channel} (same as STA connection)")
+            # Tell NetworkManager to not manage this interface
+            subprocess.run(['nmcli', 'device', 'set', virtual_iface, 'managed', 'no'], 
+                          capture_output=True, check=False)
             
             # Determine upstream interface for NAT
             upstream = get_upstream_interface(EXCLUDE_VPN)
             if not upstream:
                 upstream = physical_iface  # Use the STA connection as upstream
             
-            # Generate configs
+            # Generate configs with regulatory bypass settings
             generate_hostapd_config(virtual_iface, args.ssid, args.password, 
-                                   channel=channel, band=args.band, hidden=args.hidden)
+                                   channel=channel, band=args.band, hidden=args.hidden,
+                                   country_code='US')  # US has more permissive 5GHz rules
             dnsmasq_conf, gateway_ip = generate_dnsmasq_config(virtual_iface, args.dns)
             
             # Setup network
@@ -1572,12 +1648,25 @@ def main():
             
             # Start services
             if not start_hostapd(HOSTAPD_CONF):
-                print("⚠️ hostapd failed, falling back to standard mode")
+                # hostapd failed - DO NOT fall back to disconnecting WiFi
+                print("\n❌ STA+AP Concurrent Mode Failed!")
+                print("   hostapd could not start the hotspot on the virtual interface.")
+                if channel > 14:
+                    print(f"   Most likely cause: 5GHz channel {channel} has NO-IR restriction")
+                    print("   Your WiFi adapter's driver enforces strict regulatory compliance.")
+                    print("\n   💡 SOLUTIONS:")
+                    print("   1. Connect to a 2.4GHz WiFi network first (e.g., your router's 2.4GHz band)")
+                    print("   2. Use standard mode (WiFi will disconnect while hotspot is active)")
+                    print("   3. Use a USB WiFi adapter for the hotspot")
+                else:
+                    print("   Check system logs: journalctl -u hostapd")
+                
+                # Clean up and exit with error - DO NOT FALL BACK TO DISCONNECTING WIFI
                 stop_concurrent_mode()
                 delete_virtual_ap_interface(physical_iface)
-                USING_CONCURRENCY = False
-                actual_hotspot_iface = physical_iface
-                # Continue to NetworkManager mode below
+                write_status("error", "STA+AP mode failed - 5GHz restriction. Connect to 2.4GHz network.", is_error=True)
+                if os.path.exists(PID_FILE): os.remove(PID_FILE)
+                sys.exit(1)
             else:
                 start_dnsmasq(dnsmasq_conf)
                 
@@ -1585,16 +1674,28 @@ def main():
                 print(f"   WiFi connection preserved on {physical_iface}")
                 print(f"   Hotspot SSID: {args.ssid}")
                 print(f"   Gateway IP: {gateway_ip}")
+                if channel > 14:
+                    print(f"   ⚠️ NOTE: Using 5GHz channel {channel} - regulatory bypass attempted")
                 write_status("active", f"Hotspot '{args.ssid}' active (STA+AP mode) - WiFi preserved")
         else:
-            print(f"⚠️ Failed to create virtual interface, falling back to standard mode")
-            USING_CONCURRENCY = False
-            actual_hotspot_iface = physical_iface
+            # Failed to create virtual interface - DO NOT fall back to disconnecting WiFi
+            print(f"\n❌ Failed to create virtual interface!")
+            print("   Cannot use STA+AP concurrent mode without virtual interface.")
+            print("   Your WiFi will NOT be disconnected.")
+            write_status("error", "Failed to create virtual AP interface", is_error=True)
+            if os.path.exists(PID_FILE): os.remove(PID_FILE)
+            sys.exit(1)
+    elif supports_concurrency and is_connected and not hostapd_available:
+        # hostapd not installed - inform user but DO NOT disconnect WiFi
+        print("\n❌ Cannot use STA+AP concurrent mode!")
+        print("   hostapd and/or dnsmasq are not installed.")
+        print("   Run the installer again: sudo bash install.sh")
+        print("   Your WiFi will NOT be disconnected.")
+        write_status("error", "hostapd/dnsmasq not installed - run installer", is_error=True)
+        if os.path.exists(PID_FILE): os.remove(PID_FILE)
+        sys.exit(1)
     else:
-        # === STANDARD MODE (non-concurrent) ===
-        if supports_concurrency and is_connected and not hostapd_available:
-            print("⚠️ hostapd/dnsmasq not installed - cannot use STA+AP concurrent mode")
-            print("   Run installer again or: sudo apt install hostapd dnsmasq")
+        # NOT connected to WiFi - standard mode is OK (nothing to disconnect)
         actual_hotspot_iface = physical_iface
         USING_CONCURRENCY = False
     
