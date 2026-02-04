@@ -1671,7 +1671,15 @@ def main():
         internet_iface = args.internet_interface
     else:
         internet_iface = get_upstream_interface(EXCLUDE_VPN)
-    using_separate_adapter = internet_iface and internet_iface != physical_iface
+    
+    # Check if upstream is a VPN/Virtual interface
+    # If it is, it's not a SEPARATE Physical adapter, but a dependent one. 
+    # We must treat this as "Same Adapter" to force Concurrent Mode (preservation).
+    is_vpn_upstream = False
+    if internet_iface:
+        is_vpn_upstream = internet_iface.startswith(('tun', 'tap', 'wg', 'ppp')) or 'vpn' in internet_iface
+        
+    using_separate_adapter = internet_iface and internet_iface != physical_iface and not is_vpn_upstream
     
     if using_separate_adapter:
         # === DUAL ADAPTER MODE ===
