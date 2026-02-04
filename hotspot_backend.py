@@ -125,6 +125,25 @@ def delete_virtual_ap_interface(physical_iface):
         return True
     return False
 
+def is_physical_interface(iface):
+    """Check if an interface is backed by physical hardware (PCI/USB) vs virtual (VPN/Tun)."""
+    try:
+        # 1. Check if /sys/class/net/<iface>/device exists
+        dev_path = f"/sys/class/net/{iface}/device"
+        if not os.path.exists(dev_path):
+            return False
+            
+        # 2. Check subsystem - virtual devices often point to /sys/devices/virtual
+        # Real devices point to pci or usb
+        real_path = os.path.realpath(dev_path)
+        if "/virtual/" in real_path:
+            return False
+            
+        return True
+    except:
+        # Fallback heuristic: tun/tap/wg naming
+        return not iface.startswith(('tun', 'tap', 'wg', 'ppp'))
+
 def get_best_channel(iface, band='bg'):
     """
     Select the best channel for the given band.
@@ -1667,19 +1686,18 @@ def main():
     
     # Check if we're using a SEPARATE adapter for hotspot (dual-adapter mode)
     # In dual-adapter mode, NO regulatory restrictions apply - each adapter is independent
-    if args.internet_interface:
-        internet_iface = args.internet_interface
-    else:
-        internet_iface = get_upstream_interface(EXCLUDE_VPN)
+    internet_iface = get_upstream_interface(EXCLUDE_VPN)
     
-    # Check if upstream is a VPN/Virtual interface
-    # If it is, it's not a SEPARATE Physical adapter, but a dependent one. 
-    # We must treat this as "Same Adapter" to force Concurrent Mode (preservation).
-    is_vpn_upstream = False
-    if internet_iface:
-        is_vpn_upstream = internet_iface.startswith(('tun', 'tap', 'wg', 'ppp')) or 'vpn' in internet_iface
-        
-    using_separate_adapter = internet_iface and internet_iface != physical_iface and not is_vpn_upstream
+    # Check if upstream is physically separate
+    # Virtual interfaces (VPNs) are NOT separate adapters.
+    is_separate_physical = False
+    if internet_iface and internet_iface != physical_iface:
+        is_separate_physical = is_physical_interface(internet_iface)
+        print(f"Upstream {internet_iface} is physical? {is_separate_physical}")
+
+    using_separate_adapter = is_separate_physical
+    
+    print(f"Decision: Dual Adapter={using_separate_adapter}, Concurrency={supports_concurrency}, Connected={is_connected}")
     
     if using_separate_adapter:
         # === DUAL ADAPTER MODE ===
