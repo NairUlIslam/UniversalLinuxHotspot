@@ -1364,12 +1364,14 @@ def get_upstream_interface(exclude_vpn=False):
     try:
         # standard mode: trust the kernel (includes VPN if active)
         if not exclude_vpn:
-            output = run_command(['ip', 'route', 'get', '1.1.1.1'], check=False)
-            # Output: 1.1.1.1 via 192.168.1.1 dev enp3s0 src ...
-            if output:
-                match = re.search(r'dev\s+(\S+)', output)
-                if match:
-                    return match.group(1)
+            # Try multiple targets to determine true default route
+            for target in ['1.1.1.1', '8.8.8.8']:
+                output = run_command(['ip', 'route', 'get', target], check=False)
+                # Output: 1.1.1.1 via 192.168.1.1 dev enp3s0 src ...
+                if output:
+                    match = re.search(r'dev\s+(\S+)', output)
+                    if match:
+                        return match.group(1)
             # Fallback for standard mode - still don't filter VPN
             output = run_command(['ip', '-4', 'route', 'show', 'default'], check=False)
             if output:
@@ -1443,13 +1445,16 @@ def update_firewall(hotspot_iface, upstream_iface):
     # Force Policy to ACCEPT (Fixes Docker/Firewalld interference)
     run_command(['iptables', '-P', 'FORWARD', 'ACCEPT'], check=False)
 
+    # TCP MSS Clamping - MUST be in mangle table for correctness
+    # This fixes issues with packet fragmentation over VPNs and some ISPs
+    run_command(['iptables', '-t', 'mangle', '-F', 'FORWARD'], check=False)
     run_command([
-        'iptables', '-I', 'FORWARD', '1', 
+        'iptables', '-t', 'mangle', '-I', 'FORWARD', '1', 
         '-p', 'tcp', '--tcp-flags', 'SYN,RST', 'SYN', 
         '-j', 'TCPMSS', '--clamp-mss-to-pmtu'
     ], check=False)
 
-    # Insert at TOP to override other rules
+    # Insert forwarding rules in filter table
     run_command(['iptables', '-I', 'FORWARD', '1', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT'], check=False)
     run_command(['iptables', '-I', 'FORWARD', '1', '-i', upstream_iface, '-o', hotspot_iface, '-j', 'ACCEPT'], check=False)
     
@@ -1481,7 +1486,7 @@ def cleanup(signal_received=None, frame=None):
     
     # 2. Clean Firewall
     run_command(['iptables', '-t', 'nat', '-F', 'POSTROUTING'], check=False)
-    run_command(['iptables', '-D', 'FORWARD', '-p', 'tcp', '--tcp-flags', 'SYN,RST', 'SYN', '-j', 'TCPMSS', '--clamp-mss-to-pmtu'], check=False)
+    run_command(['iptables', '-t', 'mangle', '-F', 'FORWARD'], check=False) # Clean mangle too
     run_command(['iptables', '-D', 'FORWARD', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT'], check=False)
     
     # 3. Delete the hotspot connection (NetworkManager mode)
