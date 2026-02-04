@@ -141,8 +141,25 @@ def is_physical_interface(iface):
             
         return True
     except:
-        # Fallback heuristic: tun/tap/wg naming
         return not iface.startswith(('tun', 'tap', 'wg', 'ppp'))
+
+def get_system_country_code():
+    """Detect the current regulatory country code from the system."""
+    try:
+        # Check 'iw reg get'
+        result = subprocess.run(['iw', 'reg', 'get'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if line.startswith('country'):
+                    # Parse: country IN: DFS-ETSI
+                    match = re.search(r'country\s+([A-Z]{2})', line)
+                    if match:
+                        return match.group(1).upper()
+    except:
+        pass
+    
+    # Fallback to 'US'
+    return 'US'
 
 def get_best_channel(iface, band='bg'):
     """
@@ -219,13 +236,13 @@ def attempt_regulatory_bypass():
     except:
         return False
 
-def generate_hostapd_config(iface, ssid, password, channel=6, band='bg', hidden=False, country_code='US'):
-    """Generate hostapd configuration file with regulatory settings."""
-    # Determine hardware mode based on band and channel
+def generate_hostapd_config(iface, ssid, password, channel=6, band='bg', hidden=False, country_code=None):
+    if not country_code: country_code = 'US'
+    """Generate hostapd configuration file with High Performance settings."""
     if band == 'a' or channel > 14:
+        # 5GHz Mode (802.11ac + 802.11n)
         hw_mode = 'a'
-        # For 5GHz, add regulatory settings to try bypassing NO-IR
-        config = f"""# Hotspot hostapd configuration
+        config = f"""# Hotspot hostapd configuration (High Performance 5GHz)
 interface={iface}
 driver=nl80211
 ssid={ssid}
@@ -235,6 +252,8 @@ ieee80211h=1
 hw_mode={hw_mode}
 channel={channel}
 wmm_enabled=1
+ieee80211n=1
+ieee80211ac=1
 macaddr_acl=0
 auth_algs=1
 ignore_broadcast_ssid={'1' if hidden else '0'}
@@ -244,21 +263,25 @@ wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
 """
     else:
+        # 2.4GHz Mode (802.11n + HT40)
         hw_mode = 'g'
-        config = f"""# Hotspot hostapd configuration
+        config = f"""# Hotspot hostapd configuration (High Performance 2.4GHz)
 interface={iface}
 driver=nl80211
 ssid={ssid}
+country_code={country_code}
+ieee80211d=1
 hw_mode={hw_mode}
 channel={channel}
-wmm_enabled=0
+wmm_enabled=1
+ieee80211n=1
+ht_capab=[HT40+]
 macaddr_acl=0
 auth_algs=1
 ignore_broadcast_ssid={'1' if hidden else '0'}
 wpa=2
 wpa_passphrase={password}
 wpa_key_mgmt=WPA-PSK
-wpa_pairwise=TKIP
 rsn_pairwise=CCMP
 """
     
@@ -1559,9 +1582,14 @@ def main():
     parser.add_argument('--force-single-interface', action='store_true', 
                         help='Force hotspot on single WiFi interface even if it will disconnect internet')
     parser.add_argument('--internet-interface', help='Explicitly set upstream internet interface')
+    parser.add_argument('--country', help='Regulatory country code (e.g., US, IN, GB)')
     parser.add_argument('--stop', action='store_true')
     
     args = parser.parse_args()
+
+    # Determine country code early
+    COUNTRY_CODE = args.country if args.country else get_system_country_code()
+    print(f"Regulatory Domain: {COUNTRY_CODE}")
 
     if args.stop:
         print("Stopping hotspot...")
@@ -1767,7 +1795,7 @@ def main():
             # Generate configs with regulatory settings
             generate_hostapd_config(virtual_iface, args.ssid, args.password, 
                                    channel=channel, band=args.band, hidden=args.hidden,
-                                   country_code='IN')  # India regulatory domain
+                                   country_code=COUNTRY_CODE) 
             dnsmasq_conf, gateway_ip = generate_dnsmasq_config(virtual_iface, args.dns)
             
             # Setup network
