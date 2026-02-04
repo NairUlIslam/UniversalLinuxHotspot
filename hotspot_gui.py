@@ -67,7 +67,8 @@ class SettingsManager:
             "blocked_macs": [],
             "allowed_macs": [],
             "dark_mode": False,
-            "route_vpn": True
+            "route_vpn": True,
+            "country": ""
         }
         self.load()
 
@@ -280,6 +281,12 @@ class SettingsDialog(QDialog):
         self.vpn_check.setChecked(is_vpn)
         self.vpn_check.setToolTip("If unchecked, hotspot clients will bypass VPN and use direct internet.")
         layout.addWidget(self.vpn_check)
+
+        layout.addWidget(QLabel("Regulatory Country (Optional):"))
+        self.country_input = QLineEdit(self.settings.get("country") or "")
+        self.country_input.setPlaceholderText("Leave empty for Auto-detect (e.g., US, IN)")
+        self.country_input.setToolTip("Override system regulatory domain. Useful for bypassing channel restrictions.")
+        layout.addWidget(self.country_input)
         
         # MAC Filter button
         mac_btn = QPushButton("Manage Devices (Block/Allow)")
@@ -427,6 +434,7 @@ class SettingsDialog(QDialog):
         self.settings.set("hidden", self.hidden_check.isChecked())
         self.settings.set("dns", self.dns_input.text().strip())
         self.settings.set("route_vpn", self.vpn_check.isChecked())
+        self.settings.set("country", self.country_input.text().strip().upper())
         self.accept()
 
 class ConnectedDevicesDialog(QDialog):
@@ -816,6 +824,9 @@ class HotspotTray(QSystemTrayIcon):
             if use_vpn is None: use_vpn = True # Default On
             if not use_vpn:
                 cmd.append("--exclude-vpn")
+            
+            if s.get("country"):
+                cmd.extend(["--country", s.get("country")])
 
             target_list = s.get("blocked_macs") if s.get("mac_mode") == "block" else s.get("allowed_macs")
             
