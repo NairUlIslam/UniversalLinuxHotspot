@@ -74,7 +74,8 @@ When using a separate WiFi adapter for the hotspot (e.g., USB WiFi dongle):
 - **No Regulatory Restrictions**: Each adapter operates independently.
 - **Any Channel/Band**: Hotspot can use any channel regardless of connected network.
 - **Automatic Detection**: App detects when internet comes from a different interface than the hotspot adapter.
-- **Optimal Performance**: Dedicated hotspot adapter provides better performance.
+- **Priority Selection**: The app **automatically prioritizes** this mode over internal concurrent mode to ensure maximum speed.
+- **Optimal Performance**: Dedicated hotspot adapter provides 2x throughput compared to concurrent mode (avoids time-slicing).
 
 ### ⏱️ **Convenience Features**
 - Auto-off timer (1-120 minutes)
@@ -236,7 +237,7 @@ The app shows detailed labels for each interface:
 | **Wi-Fi software blocked** | RF-kill detected | Run: `sudo rfkill unblock wifi` |
 | **No AP mode support** | iw capability check | Use a different USB Wi-Fi adapter |
 | **Interface in monitor mode** | iw mode check | Run: `sudo iw dev <iface> set type managed` |
-| **Interface DOWN** | ip link check | Check driver or hardware connection |
+| **Interface DOWN** | ip link check | **Auto-recovered** (App attempts to wake up interface & unblock rfkill) |
 | **5GHz selected but unsupported** | Per-interface check | Switch to 2.4 GHz band |
 
 ### Network Issues

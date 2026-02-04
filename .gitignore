@@ -7,3 +7,9 @@ __pycache__/
 hotspot_backend.pid
 hotspot_status.json
 hotspot_qr.png
+local_wheels/
+*.json
+.agent/
+.gemini/
+*.swp
+*.bak

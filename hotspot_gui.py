@@ -797,10 +797,16 @@ class HotspotTray(QSystemTrayIcon):
             self.run_sudo_command(["sudo", BACKEND_SCRIPT, "--stop"])
         else:
             self.status_action.setText("Status: Starting...")
-            s=self.settings; cmd = ["sudo", BACKEND_SCRIPT, 
+            
+            # Force reload settings from disk to ensure we have latest manual changes
+            self.settings.load()
+            s = self.settings
+            
+            cmd = ["sudo", BACKEND_SCRIPT, 
                    "--ssid", s.get("ssid"), "--password", s.get("password"),
                    "--band", s.get("band") or "bg", "--auto-off", str(s.get("auto_off") or 0),
                    "--mac-mode", s.get("mac_mode") or "block"]
+            
             if s.get("interface"): cmd.extend(["--interface", s.get("interface")])
             if s.get("internet_interface"): cmd.extend(["--internet-interface", s.get("internet_interface")])
             if s.get("hidden"): cmd.append("--hidden")
@@ -825,8 +831,11 @@ class HotspotTray(QSystemTrayIcon):
             if target_list:
                 for mac in target_list: cmd.extend([flag, mac])
             
+            print(f"DEBUG: Launching backend with command: {' '.join(cmd)}")
+            
             subprocess.run(["sudo", "pkill", "-f", "hotspot_backend.py"])
             
+            # Use Popen to run in background
             subprocess.Popen(cmd)
             self.showMessage("Hotspot", "Starting hotspot...", QSystemTrayIcon.MessageIcon.Information, 2000)
 
@@ -849,6 +858,9 @@ def main():
     socket = QLocalSocket()
     socket.connectToServer(SOCKET_NAME)
     if socket.waitForConnected(500):
+        # Another instance is running, ask it to wake up
+        # We can't easily send data in this simple check, but checking connection is enough
+        # In a real app we might send a "wakeup" command here
         socket.disconnectFromServer()
         sys.exit(0)
     app.setQuitOnLastWindowClosed(False)

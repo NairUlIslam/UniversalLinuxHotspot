@@ -31,10 +31,10 @@ echo "Location: $PROJECT_DIR"
 echo "Checking system dependencies..."
 if command -v apt-get &> /dev/null; then
     # Debian/Ubuntu
-    if ! command -v hostapd &> /dev/null || ! command -v dnsmasq &> /dev/null; then
-        echo "Installing hostapd and dnsmasq for STA+AP concurrent mode..."
+    if ! command -v hostapd &> /dev/null || ! command -v dnsmasq &> /dev/null || ! command -v rfkill &> /dev/null; then
+        echo "Installing hostapd, dnsmasq, and rfkill..."
         apt-get update -qq
-        apt-get install -y hostapd dnsmasq
+        apt-get install -y hostapd dnsmasq rfkill
         # Disable auto-start of hostapd and dnsmasq (we manage them manually)
         systemctl disable hostapd 2>/dev/null || true
         systemctl stop hostapd 2>/dev/null || true
@@ -43,9 +43,9 @@ if command -v apt-get &> /dev/null; then
     fi
 elif command -v dnf &> /dev/null; then
     # Fedora/RHEL
-    if ! command -v hostapd &> /dev/null || ! command -v dnsmasq &> /dev/null; then
-        echo "Installing hostapd and dnsmasq for STA+AP concurrent mode..."
-        dnf install -y hostapd dnsmasq
+    if ! command -v hostapd &> /dev/null || ! command -v dnsmasq &> /dev/null || ! command -v rfkill &> /dev/null; then
+        echo "Installing hostapd and dnsmasq..."
+        dnf install -y hostapd dnsmasq rfkill
         systemctl disable hostapd 2>/dev/null || true
         systemctl stop hostapd 2>/dev/null || true
         systemctl disable dnsmasq 2>/dev/null || true
@@ -53,16 +53,16 @@ elif command -v dnf &> /dev/null; then
     fi
 elif command -v pacman &> /dev/null; then
     # Arch Linux
-    if ! command -v hostapd &> /dev/null || ! command -v dnsmasq &> /dev/null; then
-        echo "Installing hostapd and dnsmasq for STA+AP concurrent mode..."
-        pacman -S --noconfirm hostapd dnsmasq
+    if ! command -v hostapd &> /dev/null || ! command -v dnsmasq &> /dev/null || ! command -v rfkill &> /dev/null; then
+        echo "Installing hostapd and dnsmasq..."
+        pacman -S --noconfirm hostapd dnsmasq rfkill
         systemctl disable hostapd 2>/dev/null || true
         systemctl stop hostapd 2>/dev/null || true
         systemctl disable dnsmasq 2>/dev/null || true
         systemctl stop dnsmasq 2>/dev/null || true
     fi
 else
-    echo "Warning: Could not detect package manager. Please install 'hostapd' and 'dnsmasq' manually for STA+AP concurrent mode."
+    echo "Warning: Could not detect package manager. Please install 'hostapd', 'dnsmasq', and 'rfkill' manually."
 fi
 
 # 1. Setup Python Virtual Environment
@@ -72,12 +72,12 @@ if [ ! -d "$VENV_DIR" ]; then
 fi
 
 echo "Installing Python dependencies..."
-"$PYTHON_BIN" -m pip install --upgrade pip -q
+"$PYTHON_BIN" -m pip install --upgrade pip
 if [ -f "$PROJECT_DIR/requirements.txt" ]; then
-    "$PYTHON_BIN" -m pip install -r "$PROJECT_DIR/requirements.txt" -q
+    "$PYTHON_BIN" -m pip install -r "$PROJECT_DIR/requirements.txt"
 else
     # Default requirements if file missing
-    "$PYTHON_BIN" -m pip install PyQt6 qrcode Pillow -q
+    "$PYTHON_BIN" -m pip install PyQt6 qrcode Pillow
 fi
 
 # 2. Setup Sudoers for Wrapper Script

@@ -325,6 +325,10 @@ def setup_concurrent_ap_network(iface, gateway_ip, upstream_iface):
     subprocess.run(['iptables', '-A', 'FORWARD', '-i', iface, '-o', upstream_iface, '-j', 'ACCEPT'], check=False)
     subprocess.run(['iptables', '-A', 'FORWARD', '-i', upstream_iface, '-o', iface, 
                    '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT'], check=False)
+    
+    # Fix MTU issues for VPN (clamp MSS to PMTU) - Critical for concurrent-mode VPN routing
+    subprocess.run(['iptables', '-A', 'FORWARD', '-p', 'tcp', '--tcp-flags', 'SYN,RST', 'SYN', 
+                   '-j', 'TCPMSS', '--clamp-mss-to-pmtu'], check=False)
 
 def stop_concurrent_mode():
     """Stop hostapd and dnsmasq, cleanup everything."""
@@ -821,12 +825,14 @@ def get_smart_interface_selection(manual_internet_iface=None):
     # Categorize interfaces
     ethernet_ifaces = [i for i in interfaces if i['type'] == 'ethernet' and i['state'] != 'unavailable']
     wifi_ifaces = [i for i in interfaces if i['type'] == 'wifi']
+
     vpn_ifaces = [i for i in interfaces if i.get('is_vpn') and i.get('has_ip')]
     mobile_ifaces = [i for i in interfaces if i.get('is_mobile') and i.get('has_ip')]
     tether_ifaces = [i for i in interfaces if i.get('is_tethered') and i.get('has_ip')]
     
     # Filter WiFi by capabilities
     usb_wifi = [i for i in wifi_ifaces if i.get('is_usb') and i.get('ap_support') and not i.get('in_monitor_mode')]
+
     internal_wifi = [i for i in wifi_ifaces if i.get('is_internal') and not i.get('in_monitor_mode')]
     ap_capable_wifi = [i for i in wifi_ifaces if i.get('ap_support') and not i.get('in_monitor_mode')]
     
@@ -884,34 +890,35 @@ def get_smart_interface_selection(manual_internet_iface=None):
     # Filter for concurrency-capable WiFi
     concurrent_wifi = [i for i in wifi_ifaces if i.get('supports_concurrency') and i.get('ap_support') and not i.get('in_monitor_mode')]
     
-    # NEW Priority 0: Concurrency-capable WiFi that is providing internet
-    # This is the OPTIMAL case - same adapter does both STA (client) and AP (hotspot)
-    concurrent_and_connected = [i for i in concurrent_wifi if i.get('connected')]
-    
-    if concurrent_and_connected and internet_iface in [i['name'] for i in concurrent_and_connected]:
-        # Use the same adapter for both - this is ideal!
-        candidate = [i for i in concurrent_and_connected if i['name'] == internet_iface][0]
-        hotspot_iface = candidate['name']
-        channels = candidate.get('concurrency_channels', 1)
-        if channels >= 2:
-            reason += f" | 🎯 Same WiFi for hotspot (STA+AP concurrent, {channels} channels)"
-        else:
-            reason += " | 🎯 Same WiFi for hotspot (STA+AP concurrent, same channel)"
-    
-    # Priority 1: USB WiFi adapter with AP support
-    elif usb_wifi:
+    # Priority 1: USB WiFi adapter with AP support (ALWAYS PREFERRED)
+    # Using a separate physical radio is always better than time-slicing one radio
+    if usb_wifi:
         hotspot_iface = usb_wifi[0]['name']
-        reason += " | 🔌 USB adapter for hotspot"
-    
-    # Priority 2: Concurrency-capable internal WiFi (even if connected)
+        reason += " | 🔌 USB adapter for hotspot (Dedicated Hardware)"
+        
+    # Priority 2: Concurrency-capable WiFi that is providing internet
+    # This is the Next Best case - same adapter does both STA (client) and AP (hotspot)
     elif concurrent_wifi:
-        candidate = concurrent_wifi[0]
-        hotspot_iface = candidate['name']
-        if candidate.get('connected'):
+        concurrent_and_connected = [i for i in concurrent_wifi if i.get('connected')]
+        
+        # If internet source is a concurrent-capable WiFi, use it!
+        if concurrent_and_connected and internet_iface in [i['name'] for i in concurrent_and_connected]:
+            candidate = [i for i in concurrent_and_connected if i['name'] == internet_iface][0]
+            hotspot_iface = candidate['name']
             channels = candidate.get('concurrency_channels', 1)
-            reason += f" | 🎯 Built-in WiFi (STA+AP concurrent)"
+            if channels >= 2:
+                reason += f" | 🎯 Same WiFi for hotspot (STA+AP concurrent, {channels} channels)"
+            else:
+                reason += " | 🎯 Same WiFi for hotspot (STA+AP concurrent, same channel)"
+        
+        # Otherwise just pick the best concurrent-capable one
         else:
-            reason += " | 📶 Built-in WiFi for hotspot"
+            candidate = concurrent_wifi[0]
+            hotspot_iface = candidate['name']
+            if candidate.get('connected'):
+                reason += f" | 🎯 Built-in WiFi (STA+AP concurrent)"
+            else:
+                reason += " | 📶 Built-in WiFi for hotspot"
     
     # Priority 3: Internal WiFi NOT being used for internet (legacy - no concurrency)
     elif internal_wifi:
@@ -1023,7 +1030,24 @@ def check_interface_state(iface):
             return False, f"Interface {iface} not found in system"
         
         if 'state DOWN' in result.stdout:
-            return False, f"Interface {iface} is DOWN. It may be disabled or have driver issues."
+            print(f"Interface {iface} is DOWN. Attempting to bring it UP...")
+            # Try to unblock radio first
+            subprocess.run(['rfkill', 'unblock', 'wifi'], check=False)
+            subprocess.run(['ip', 'link', 'set', iface, 'up'], check=False)
+            
+            # Retry loop (give it up to 5 seconds)
+            for _ in range(5):
+                time.sleep(1)
+                result = subprocess.run(['ip', 'link', 'show', iface], capture_output=True, text=True)
+                if 'state DOWN' not in result.stdout:
+                    print(f"Interface {iface} is now UP.")
+                    return True, None
+            
+            # If still down, return True (Success) but with a Warning.
+            # We proceeded because nmcli often can bring it up automatically during connection.
+            msg = f"Interface {iface} appears DOWN. Proceeding anyway, but this may fail."
+            print(f"Warning: {msg}")
+            return True, msg
         if 'NO-CARRIER' in result.stdout and 'state UP' not in result.stdout:
             return True, f"Interface {iface} has no carrier (normal for WiFi before connection)"
         return True, None
@@ -1758,6 +1782,10 @@ def main():
 
             print("Activating hotspot...")
             run_command(['nmcli', 'con', 'up', CONNECTION_NAME, 'ifname', actual_hotspot_iface])
+            
+            # Fix MTU/Speed issues (MSS Clamping) - Global fix for all modes (Standard + Concurrent)
+            run_command(['iptables', '-A', 'FORWARD', '-p', 'tcp', '--tcp-flags', 'SYN,RST', 'SYN', 
+                         '-j', 'TCPMSS', '--clamp-mss-to-pmtu'], check=False)
             
             print(f"\nHotspot ACTIVE on {actual_hotspot_iface}")
             write_status("active", f"Hotspot '{args.ssid}' is now active on {actual_hotspot_iface}")
