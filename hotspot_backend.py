@@ -1434,6 +1434,14 @@ def update_firewall(hotspot_iface, upstream_iface):
     print(f"-> Routing update: Internet from {upstream_iface} -> Hotspot on {hotspot_iface}")
 
     run_command(['sysctl', '-w', 'net.ipv4.ip_forward=1'], check=False)
+    # Disable Reverse Path Filtering - Critical for VPN + Hotspot routing
+    run_command(['sysctl', '-w', 'net.ipv4.conf.all.rp_filter=0'], check=False)
+    run_command(['sysctl', '-w', 'net.ipv4.conf.default.rp_filter=0'], check=False)
+    try:
+        run_command(['sysctl', '-w', f'net.ipv4.conf.{upstream_iface}.rp_filter=0'], check=False)
+        run_command(['sysctl', '-w', f'net.ipv4.conf.{hotspot_iface}.rp_filter=0'], check=False)
+    except: pass
+    
     run_command(['iptables', '-t', 'nat', '-F', 'POSTROUTING'], check=False)
     run_command(['iptables', '-F', 'FORWARD'], check=False)
     
